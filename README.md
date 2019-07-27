@@ -1,1 +1,1 @@
-https://thiebaud.ernstberger.app/
+https://tebo.dev
