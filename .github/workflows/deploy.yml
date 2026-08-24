@@ -1,0 +1,90 @@
+name: deploy
+
+# Push to master goes straight to production. No staging, by choice: this is a
+# static resume page with no build step, no database and no form, so the blast
+# radius of a bad commit is a page that looks wrong until the next push.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Two deploys racing would interleave rsyncs into one directory, and --delete
+# makes that worse than it sounds. Queue instead, and never cancel one
+# mid-flight.
+concurrency:
+  group: deploy-portfolio
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Written by hand rather than through a third-party action: anything
+      # handling this secret is worth being able to read in full. known_hosts is
+      # pinned, so a substituted host aborts rather than being trusted.
+      - name: Configure SSH
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host target
+            HostName ${{ secrets.DEPLOY_HOST }}
+            User deploy-portfolio
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ConnectTimeout 20
+          EOF
+          chmod 600 ~/.ssh/config
+
+      # rsync of the tree CI checked out, not a git pull on the server: the box
+      # holds no GitHub credentials and ships exactly what was tested.
+      #
+      # css/ is committed already compiled, so there is nothing to build. scss/
+      # and the gulp toolchain are the source for it and are not content --
+      # excluded along with *.md, which is a shape rather than a filename so a
+      # document added here later cannot be published by accident.
+      #
+      # vendor/ ships: index.html loads Bootstrap, FontAwesome and jQuery from it.
+      - name: Deploy
+        run: |
+          rsync -rlz --delete --chmod=D750,F640 -e ssh \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='node_modules' \
+            --exclude='scss' \
+            --exclude='gulpfile.js' \
+            --exclude='package.json' \
+            --exclude='package-lock.json' \
+            --exclude='*.md' \
+            ./ target:/srv/portfolio/
+
+      - name: Smoke check
+        run: |
+          ssh target 'test -f /srv/portfolio/index.html && echo "index.html present on the box"'
+          ssh target 'test -d /srv/portfolio/vendor/bootstrap && echo "vendor/bootstrap present"'
+          ssh target 'find /srv/portfolio -type f | wc -l | sed "s|^|files deployed: |"'
+
+          # The public check only means something once DNS points at this box.
+          # Run before cutover it would be curling the old server and passing for
+          # the wrong reason, which is worse than not checking at all.
+          resolved=$(getent hosts tebo.dev | awk '{print $1}' | head -1)
+          if [ "$resolved" = "${{ secrets.DEPLOY_HOST }}" ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 https://tebo.dev/)
+            echo "https://tebo.dev/ -> HTTP $code"
+            [ "$code" = "200" ] || { echo "::error::site did not return 200"; exit 1; }
+          else
+            echo "tebo.dev resolves to $resolved, not this box."
+            echo "Skipping the public check -- it would be testing the old server."
+          fi
